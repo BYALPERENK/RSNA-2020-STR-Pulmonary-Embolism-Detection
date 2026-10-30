@@ -1,0 +1,39 @@
+# --- Data & artifacts (never commit) ---
+/data/
+/models/
+/outputs/
+*.dcm
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.zip
+configs/paths.local.yaml
+
+# --- Experiment tracking ---
+wandb/
+mlruns/
+lightning_logs/
+runs/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
