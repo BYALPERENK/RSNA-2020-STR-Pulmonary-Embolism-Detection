@@ -200,6 +200,13 @@ def store_path(store_dir, series, image) -> Path:
     return Path(store_dir) / series / f"{image}{STORE.suffix}"
 
 
+def halve(stored: np.ndarray) -> np.ndarray:
+    """A stored image at half its size: every pixel is the mean of 2 x 2 pixels, rounded (04, section 1). The 256 px store
+    is written with it, and the test images must go through the same function."""
+    a = stored.astype(np.uint32)
+    return ((a[::2, ::2] + a[::2, 1::2] + a[1::2, ::2] + a[1::2, 1::2] + 2) // 4).astype(np.uint16)
+
+
 def write_slice(source, out_path) -> dict:
     """Write one slice to the store (unless it is already there) and return its pixel statistics, computed on the stored HU.
 

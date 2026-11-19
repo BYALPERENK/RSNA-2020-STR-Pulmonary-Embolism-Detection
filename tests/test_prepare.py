@@ -4,8 +4,20 @@ import pandas as pd
 import pytest
 
 from pe.data.dicom import HU_MIN, read_hu
-from pe.data.prepare import STORE, add_stacks, iterative_folds, pixel_stats, stack_ids, write_slice
+from pe.data.prepare import STORE, add_stacks, halve, iterative_folds, pixel_stats, stack_ids, write_slice
 from test_dicom import write_dicom
+
+
+def test_halve_takes_the_rounded_mean_of_2_x_2_pixels():
+    stored = np.array([[0, 1, 10, 20], [1, 2, 30, 40], [4095, 4095, 0, 0], [4095, 4095, 0, 0]], dtype=np.uint16)
+    small = halve(stored)
+    assert small.dtype == np.uint16
+    assert small.tolist() == [[1, 25], [4095, 0]]
+
+
+def test_halve_does_not_overflow_at_the_largest_stored_value():
+    assert halve(np.full((512, 512), 65535, dtype=np.uint16)).tolist()[0][0] == 65535
+    assert halve(np.full((512, 512), 65535, dtype=np.uint16)).shape == (256, 256)
 
 
 def test_a_new_kind_of_slice_starts_a_new_stack():
