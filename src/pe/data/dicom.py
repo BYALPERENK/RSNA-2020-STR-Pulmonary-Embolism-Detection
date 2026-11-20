@@ -83,7 +83,11 @@ def read_hu(path, size: int = IMAGE_SIZE) -> np.ndarray:
 
     Raises if the pixels cannot be read; a broken file never becomes an empty image.
     """
-    ds = pydicom.dcmread(path)
+    return dataset_hu(pydicom.dcmread(path), size)
+
+
+def dataset_hu(ds: pydicom.Dataset, size: int = IMAGE_SIZE) -> np.ndarray:
+    """`read_hu` on a file already read."""
     hu = to_hu(ds.pixel_array, float(ds.RescaleSlope), float(ds.RescaleIntercept))
     hu = orient(np.clip(hu, HU_MIN, HU_MAX), [float(v) for v in ds.ImageOrientationPatient])
     return to_square(hu, size)

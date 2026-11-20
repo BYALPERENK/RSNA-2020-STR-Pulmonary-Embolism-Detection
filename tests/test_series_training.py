@@ -5,9 +5,9 @@ import torch
 from scipy.special import expit
 
 from pe.data.prepare import IMAGE_LABEL, SERIES_LABELS
-from pe.metrics import score
+from pe.metrics import IMAGE_WEIGHT, SERIES_WEIGHTS, score
 from pe.models.series_model import SeriesModel
-from pe.series_training import batch, series_data, series_loss, with_neighbours
+from pe.series_training import SliceFeatures, batch, on_slices, series_data, series_loss, with_neighbours
 
 
 def small_data(lengths=(5, 3, 7), n_in=2, seed=0):
@@ -70,3 +70,54 @@ def test_a_reversed_series_reverses_its_labels():
     b = batch(data, np.array([0]), flip=np.array([True]), neighbours=False, device="cpu")
     assert np.array_equal(b["x"][0].numpy(), data.features[0][::-1])
     assert np.array_equal(b["y_image"][0].numpy(), data.y_image[0][::-1])
+
+
+def test_resampled_series_come_back_to_their_own_slices():
+    table, series, features = small_data()
+    data = series_data(table, series, features)
+    b = batch(data, np.arange(3), length=4, device="cpu")
+    assert b["x"].shape == (3, 4, 6) and b["lengths"].tolist() == [4, 4, 4] and b["n_slices"].tolist() == [5, 3, 7]
+    assert np.allclose(b["x"][0, [0, -1], :2].numpy(), data.features[0][[0, -1]])  # the ends are kept
+    ramp = torch.linspace(0, 1, 4).repeat(3, 1)
+    back = on_slices(ramp, b)
+    assert back.shape == (3, 7)
+    assert torch.allclose(back[2], torch.linspace(0, 1, 7)) and torch.allclose(back[1, :3], torch.tensor([0, 0.5, 1]))
+
+
+def test_negative_q_lets_the_series_without_pe_train_the_slice_head():
+    table, series, features = small_data()
+    table[IMAGE_LABEL] = 0
+    table.loc[table["series"] == "s0", IMAGE_LABEL] = 1  # only s0 has positive slices
+    data = series_data(table, series, features)
+    b = batch(data, np.arange(3), device="cpu")
+    series_logits, low, high = torch.zeros(3, 9), torch.zeros(3, 7), torch.zeros(3, 7)
+    high[1:] = 5  # other slice logits in the series without PE
+    assert series_loss(low, series_logits, b).item() == series_loss(high, series_logits, b).item()
+    assert series_loss(low, series_logits, b, negative_q=0.2).item() < series_loss(high, series_logits, b, negative_q=0.2).item()
+
+
+def test_slice_features_put_the_backbones_side_by_side(tmp_path):
+    index = pd.DataFrame({"series": ["a", "a", "b"], "image": ["1", "2", "3"]})
+    index.to_csv(tmp_path / "index.csv", index=False)
+    for name, width in (("x", 2), ("y", 1)):
+        (tmp_path / name).mkdir()
+        np.save(tmp_path / name / "f0.npy", np.arange(3 * width, dtype=np.float16).reshape(3, width) + (100 if name == "y" else 0))
+        np.save(tmp_path / name / "logits_f0.npy", np.array([-1, -2, -3], np.float32) * (10 if name == "y" else 1))
+    both = SliceFeatures(tmp_path, 0, ["x", "y"], "both")
+    assert both.dtype == np.float16 and both[[2, 0]].tolist() == [[4, 5, -3, 102, -30], [0, 1, -1, 100, -10]]
+    logits = SliceFeatures(tmp_path, 0, ["x", "y"], "logit")
+    assert logits.dtype == np.float32 and logits[[1]].tolist() == [[-2, -20]]
+    table = pd.DataFrame({"series": ["b", "a", "a"], "image": ["3", "9", "1"], "main": [True, False, True]})
+    assert SliceFeatures(tmp_path, 0, ["x"], "embedding").rows_of(table).tolist() == [2, 0]
+
+
+def test_a_fixed_denominator_adds_the_batches_up_to_the_metric():
+    table, series, features = small_data()
+    data = series_data(table, series, features)
+    rng = np.random.default_rng(3)
+    slice_logits, series_logits = torch.tensor(rng.normal(size=(3, 7))).float(), torch.tensor(rng.normal(size=(3, 9))).float()
+    whole = batch(data, np.arange(3), device="cpu")
+    weight = (whole["q"] * whole["n_slices"]).mean().item() * IMAGE_WEIGHT + SERIES_WEIGHTS.sum()
+    parts = [series_loss(slice_logits[i:i + 1, :n], series_logits[i:i + 1], batch(data, np.array([i]), device="cpu"), weight_per_series=weight)
+             for i, n in enumerate(whole["n_slices"].tolist())]
+    assert abs(sum(p.item() for p in parts) / 3 - series_loss(slice_logits, series_logits, whole).item()) < 1e-5
