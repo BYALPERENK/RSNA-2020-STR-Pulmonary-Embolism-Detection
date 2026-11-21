@@ -15,7 +15,7 @@ Usage: python scripts/train_series.py --name NAME --backbones seresnext101[,conv
 
 Writes outputs/series_runs/NAME/: config.json, log.csv (one row per epoch), val.csv (the validation series), the
 probabilities before the fix val_p_series.npy (series x 9) and val_p_image.npy (every slice of the fold, in slices.csv
-order) and scores.json.
+order), scores.json and the weights model.pt.
 """
 import argparse
 import json
@@ -105,6 +105,7 @@ def main():
             total += loss.item()
         log.append({"epoch": epoch, "train loss": total / batches, "minutes": (time.time() - start) / 60})
         pd.DataFrame(log).to_csv(run_dir / "log.csv", index=False)
+    torch.save(model.state_dict(), run_dir / "model.pt")
 
     p_series, p_image = fold_predictions(fold, val_data, *predict(model, val_data, args.batch, neighbours, args.length))
     np.save(run_dir / "val_p_series.npy", p_series)
