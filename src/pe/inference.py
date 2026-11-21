@@ -1,4 +1,4 @@
-"""Predicting the test series with the slice models alone (06_submission).
+"""Predicting the test series with the slice models alone or with the series models (06_submission).
 
 Per series (one StudyInstanceUID folder) every DICOM file is read once. Its headers give the stacks and the main stack as
 in 02 (`pe.data.prepare`); the main-stack slices are decoded to the values of the png16 store, their lung boxes give the
@@ -6,7 +6,14 @@ series' box (`series_boxes`), and every main-stack slice is cut to that box and 
 models were trained (04). The models of a variant run in float16, the mean logit of each backbone is calibrated with the
 fit of scripts/fit_slice_ensemble.py, the series labels are the training label rates, and the consistency fix follows.
 A slice or series that cannot be read gets the prediction of a slice outside the main stack, never an error.
+
+With the series models (`SeriesPredictor`, `predict_series`), each GPU holds every model of the variant and takes whole
+series from a shared queue, so a variant with a single slice model uses every GPU too. Per series, the slice models of
+fold k give the features of the series models of fold k (05); their probabilities are averaged over models and folds.
 """
+import json
+import queue
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -24,7 +31,9 @@ from pe.data.dataset import series_boxes
 from pe.data.dicom import HU_MIN, as_text, dataset_hu
 from pe.data.prepare import SERIES_LABELS, STORE, add_stacks, pixel_stats, slice_table
 from pe.data.windows import WINDOWS
+from pe.models.series_model import SeriesModel
 from pe.models.slice_model import SliceModel
+from pe.series_training import with_neighbours
 from pe.training import to_windows
 
 SIZE = 512
@@ -171,10 +180,125 @@ def predict_slices(study_dirs, ensemble: SliceEnsemble, workers: int = 4, log_ev
     return pd.concat(parts, ignore_index=True).drop_duplicates("image")  # a file twice in a series: its main-stack row
 
 
-def submission(test: pd.DataFrame, predicted: pd.DataFrame, label_rates: dict, other_stack: float) -> pd.DataFrame:
+class SeriesPredictor:
+    """Every model of a series variant on one GPU; called on a series' crops, its nine series probabilities and its
+    slices' probabilities, before the consistency fix.
+
+    `slice_files[backbone][fold]`: slice model weights; `series_runs`: per series model, the run directory of each fold
+    (config.json and model.pt of scripts/train_series.py); `folds`: the folds of the variant. The slice models run in
+    float16 with their heads in float32, the series models in float32, one series at a time."""
+
+    def __init__(self, slice_files: dict, series_runs: list[list], folds: list[int], device: str, batch: int = 32):
+        self.device, self.batch, self.folds = device, batch, list(folds)
+        self.windows = [WINDOWS[name] for name in WINDOW_NAMES]
+        self.series = {k: [] for k in self.folds}  # fold: [(model, backbones, input, neighbours)]
+        needed = set()
+        for runs in series_runs:
+            for k in self.folds:
+                config = json.loads((Path(runs[k]) / "config.json").read_text())
+                assert config["fold"] == k, runs[k]
+                backbones = config["backbones"].split(",")
+                width = sum({"embedding": NUM_FEATURES[b], "logit": 1, "both": NUM_FEATURES[b] + 1}[config["input"]] for b in backbones)
+                neighbours = not config["no_neighbours"]
+                model = SeriesModel(width * (3 if neighbours else 1), config["hidden"], len(SERIES_LABELS), config["dropout"])
+                model.load_state_dict(torch.load(Path(runs[k]) / "model.pt", map_location="cpu"))
+                self.series[k].append((model.eval().to(device), backbones, config["input"], neighbours))
+                needed |= {(b, k) for b in backbones}
+        self.slice_models = {}
+        for backbone, fold in sorted(needed):
+            model = SliceModel(backbone, in_chans=len(self.windows), pretrained=False)
+            model.load_state_dict(torch.load(slice_files[backbone][fold], map_location="cpu"))
+            model = model.half().eval().to(device, memory_format=torch.channels_last)
+            model.head.float()
+            self.slice_models[backbone, fold] = model
+
+    @torch.inference_mode()
+    def __call__(self, crops: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+        n = len(crops)
+        outputs = {key: (torch.empty(n, NUM_FEATURES[key[0]], device=self.device), torch.empty(n, 1, device=self.device)) for key in self.slice_models}
+        for start in range(0, n, self.batch):
+            x = crops[start:start + self.batch, None].to(self.device)
+            windows = to_windows(x, self.windows).half().contiguous(memory_format=torch.channels_last)
+            for key, model in self.slice_models.items():
+                logits, features = model(windows)
+                outputs[key][0][start:start + len(x)] = features.float()
+                outputs[key][1][start:start + len(x), 0] = logits.float()
+        p_series, p_image, count = np.zeros(len(SERIES_LABELS)), np.zeros(n), 0
+        for k in self.folds:
+            for model, backbones, kind, neighbours in self.series[k]:
+                parts = [part for b in backbones for part, wanted in zip(outputs[b, k], (kind != "logit", kind != "embedding")) if wanted]
+                x = torch.cat(parts, dim=1)[None]
+                if neighbours:
+                    x = with_neighbours(x)
+                slice_logits, series_logits = model(x, torch.tensor([n]))
+                p_image += torch.sigmoid(slice_logits[0]).cpu().numpy()
+                p_series += torch.sigmoid(series_logits[0]).cpu().numpy()
+                count += 1
+        return p_series / count, p_image / count
+
+
+# Embedding width of each backbone (timm num_features)
+NUM_FEATURES = {"seresnext101": 2048, "convnext_tiny": 768}
+
+
+def predict_series(study_dirs, predictors: list[SeriesPredictor], workers: int = 4, log_every: int = 100) -> tuple[pd.DataFrame, dict]:
+    """One row per slice found (study, image, the probability: NaN outside the main stack or where a slice could not be
+    decoded, and whether it may be raised by the fix) and the nine series probabilities of each predicted series. The
+    series are prepared by `workers` processes and taken from a queue by one thread per predictor (GPU)."""
+    loader = DataLoader(StudyDataset(study_dirs), batch_size=None, collate_fn=as_is, num_workers=workers, prefetch_factor=2 if workers else None)
+    todo = queue.Queue(maxsize=2 * len(predictors))
+    parts, series_p, lock, start = [], {}, threading.Lock(), time.time()
+    busy = [0.0] * len(predictors)
+    counts = [0] * len(predictors)
+    errors = []
+
+    def consume(i):
+        while (item := todo.get()) is not None:
+            try:
+                p = np.full(len(item["image"]), np.nan)
+                ok = np.flatnonzero(item["ok"])
+                if len(ok):
+                    t = time.time()
+                    p_series, p_image = predictors[i](item["crops"][ok])
+                    busy[i] += time.time() - t
+                    p[ok] = p_image
+                    with lock:
+                        series_p[item["study"]] = p_series
+                with lock:
+                    parts.append(pd.DataFrame({"study": item["study"], "image": item["image"], "p": p, "main": item["main"] & ~np.isnan(p)}))
+                    counts[i] += 1
+                    done = sum(counts)
+                if done % log_every == 0:
+                    print(f"{done:,} series, {(time.time() - start) / 60:.1f} min, series per GPU {counts}", flush=True)
+            except Exception as error:  # this series keeps the fallback; the others go on
+                errors.append(f"{item['study']}: {error!r}")
+
+    threads = [threading.Thread(target=consume, args=(i,), daemon=True) for i in range(len(predictors))]
+    for thread in threads:
+        thread.start()
+    for item in loader:
+        if "error" in item:
+            print(f"series not prepared: {item['study']} ({item['error']})", flush=True)
+            continue
+        todo.put(item)
+    for _ in threads:
+        todo.put(None)
+    for thread in threads:
+        thread.join()
+    for error in errors:
+        print("series not predicted:", error, flush=True)
+    wall = time.time() - start
+    print(f"{sum(counts):,} series in {wall / 60:.1f} min; per GPU: series {counts}, busy {[f'{b / wall:.0%}' for b in busy]}", flush=True)
+    if not parts:
+        return pd.DataFrame(columns=["study", "image", "p", "main"]), series_p
+    return pd.concat(parts, ignore_index=True).drop_duplicates("image"), series_p
+
+
+def submission(test: pd.DataFrame, predicted: pd.DataFrame, label_rates: dict, other_stack: float, series_p: dict | None = None) -> pd.DataFrame:
     """The rows of the submission (id, label) for every slice and series of `test` (test.csv: StudyInstanceUID,
-    SOPInstanceUID), after the consistency fix. Slices without a prediction get `other_stack`; a series with no slice
-    that may be raised lets the fix raise any of its slices."""
+    SOPInstanceUID), after the consistency fix. Slices without a prediction get `other_stack`, series without one (or
+    all, without `series_p`) the label rates; a series with no slice that may be raised lets the fix raise any of its
+    slices."""
     table = test[["StudyInstanceUID", "SOPInstanceUID"]].drop_duplicates("SOPInstanceUID").merge(
         predicted.rename(columns={"study": "StudyInstanceUID", "image": "SOPInstanceUID"}), how="left", on=["StudyInstanceUID", "SOPInstanceUID"])
     studies, image_series = np.unique(table["StudyInstanceUID"].to_numpy(dtype="U"), return_inverse=True)
@@ -183,6 +307,9 @@ def submission(test: pd.DataFrame, predicted: pd.DataFrame, label_rates: dict, o
     has_raisable = np.bincount(image_series, weights=can_raise, minlength=len(studies)) > 0
     can_raise |= ~has_raisable[image_series]
     p_series = np.tile([label_rates[label] for label in SERIES_LABELS], (len(studies), 1))
+    for i, study in enumerate(studies):
+        if series_p and study in series_p:
+            p_series[i] = series_p[study]
     fixed_series, fixed_image = make_consistent(p_series, image_series, p_image, can_raise)
     series_rows = pd.DataFrame({"id": [f"{s}_{label}" for s in studies for label in SERIES_LABELS], "label": fixed_series.ravel()})
     return pd.concat([series_rows, pd.DataFrame({"id": table["SOPInstanceUID"], "label": fixed_image})], ignore_index=True)
