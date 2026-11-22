@@ -62,7 +62,7 @@ Where we differ:
 ```
 configs/       paths.yaml (+ paths.local.yaml, not tracked)
 notebooks/     00–06, read in order
-scripts/       data preparation, benchmarks, training, feature extraction, slice-only calibration
+scripts/       data preparation, benchmarks, training, feature extraction, slice-only calibration, test prediction
 src/pe/        the package: data, metric, consistency fix, models, training, inference
 tests/         pytest
 models/        slice model weights (not tracked)
@@ -78,13 +78,22 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-The data is 980 GB of DICOM files:
+The data is 980 GB of DICOM files. Download it with the Kaggle CLI (an API token from your Kaggle account in `~/.kaggle/kaggle.json`, and the competition rules accepted on Kaggle), then unzip it into `raw_data_dir`:
 
 ```bash
+pip install kaggle
 kaggle competitions download -c rsna-str-pulmonary-embolism-detection
+unzip rsna-str-pulmonary-embolism-detection.zip -d <raw_data_dir>
 ```
 
-Set `raw_data_dir` and `processed_data_dir` in `configs/paths.yaml`, or in `configs/paths.local.yaml` for one machine. The image store needs another 486 GB.
+`raw_data_dir` then holds `train.csv`, `test.csv`, `sample_submission.csv`, `train/` and `test/`. Set `raw_data_dir` and `processed_data_dir` in `configs/paths.yaml`, or in `configs/paths.local.yaml` for one machine. The image store needs another 486 GB.
+
+A smoke test on the first 1,000 files, into separate files (`*_limit1000`):
+
+```bash
+python scripts/extract_dicom_headers.py --limit 1000
+python scripts/prepare_data.py --limit 1000
+```
 
 ## Reproducing
 
@@ -113,11 +122,12 @@ for k in 0 1 2 3 4; do
   python scripts/train_series.py --name s7_cnxemb_nn_f${k}_s1 --backbones convnext_tiny --fold $k --no-neighbours
 done
 
-# calibration of the slice models for the slice-only submissions (06)
+# submission (06): calibration of the slice models, then outputs/submission/submission_final_5folds.csv
 python scripts/fit_slice_ensemble.py
+python scripts/predict_test.py --variant final_5folds
 ```
 
-The ConvNeXt Tiny model of fold 0 trains both epochs; its first epoch is used, as for the other folds. The test set is predicted on Kaggle with `pe.inference` (06).
+The ConvNeXt Tiny model of fold 0 trains both epochs; its first epoch is used, as for the other folds. The scores above come from the hidden test set, which only Kaggle has: there a notebook runs the steps of `scripts/predict_test.py` from a dataset with `src/`, the weights and `ensemble.json`. Locally the script predicts the series in `test/` and gives the others the label rates.
 
 On one RTX 5090, after the data preparation: about 11 hours for the SE-ResNeXt101 models, 7 for ConvNeXt Tiny, 7 for the features and 1 for the series models. Reading the DICOM files once takes about 4 hours from a hard disk. The notebooks train no neural network; they read the saved runs and score them again.
 

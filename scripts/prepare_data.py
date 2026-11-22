@@ -12,12 +12,14 @@ Writes into processed_data_dir:
 
 The DICOM files are read in one thread in the order they lie on disk (the order of dicom_headers.csv): on a hard disk
 this is several times faster than parallel reads. Decoding and writing run in --workers processes. A file that
-cannot be decoded is listed with its error at the end, and its row has no pixel statistics.
+cannot be decoded is listed with its error at the end; the run then writes slices_failed.csv instead and exits with
+an error.
 
 Needs dicom_headers.csv from scripts/extract_dicom_headers.py.
 """
 import argparse
 import os
+import sys
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 
@@ -44,12 +46,17 @@ def main():
     parser.add_argument("--tables-only", action="store_true", help="write series.csv and slices.csv without the store")
     parser.add_argument("--limit", type=int, help="first N files only, into a separate store (smoke test)")
     args = parser.parse_args()
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be at least 1")
 
     paths = load_paths()
     raw_dir, out_dir = paths["raw_data_dir"], paths["processed_data_dir"]
-    headers = pd.read_csv(out_dir / "dicom_headers.csv", dtype=str, keep_default_na=False)
-    slices, series = build_tables(headers, *load_labels(raw_dir / "train.csv"))
     suffix = f"_limit{args.limit}" if args.limit else ""  # a smoke test never mixes with the full run
+    headers_path = out_dir / f"dicom_headers{suffix}.csv"  # from extract_dicom_headers.py with the same --limit
+    if not headers_path.exists():
+        sys.exit(f"{headers_path} not found: run scripts/extract_dicom_headers.py{' --limit ' + str(args.limit) if args.limit else ''} first")
+    headers = pd.read_csv(headers_path, dtype=str, keep_default_na=False)
+    slices, series = build_tables(headers, *load_labels(raw_dir / "train.csv"))
     series.to_csv(out_dir / f"series{suffix}.csv", index=False)
     print(f"slices: {len(slices):,} | series: {len(series):,} ({series['split'].value_counts().to_dict()})", flush=True)
     if args.tables_only:
@@ -73,13 +80,16 @@ def main():
 
     stats = pd.DataFrame.from_dict(stats, orient="index")
     slices = slices[slices["image"].isin(stats.index)].join(stats, on="image")
-    slices.to_csv(out_dir / f"slices{suffix}.csv", index=False)
     failed = slices[slices["error"].notna()] if "error" in slices else slices.iloc[:0]
+    table = out_dir / f"slices{suffix}{'_failed' if len(failed) else ''}.csv"  # training never reads an incomplete table
+    slices.to_csv(table, index=False)
     for row in failed.itertuples():
         print("not decoded:", row.path, row.error)
     size = sum(e.stat().st_size for d in os.scandir(store) for e in os.scandir(d))
     print(f"store: {len(stats) - len(failed):,} files, {size / 1e9:.1f} GB -> {store} | not decoded: {len(failed)}")
-    print(f"table: {slices.shape[0]:,} rows, {slices.shape[1]} columns -> {out_dir / f'slices{suffix}.csv'}")
+    print(f"table: {slices.shape[0]:,} rows, {slices.shape[1]} columns -> {table}")
+    if len(failed):
+        sys.exit(f"{len(failed)} slices not decoded: the training would stop at them. Fix or replace their files and run again.")
 
 
 if __name__ == "__main__":

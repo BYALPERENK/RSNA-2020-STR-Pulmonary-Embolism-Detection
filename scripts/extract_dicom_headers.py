@@ -8,9 +8,13 @@ Only headers are parsed, not pixels. The table is the input of 01_eda and of the
   given, else path order. On a hard disk this is several times faster than reading them in any other order.
 - With --zip, every file is also read whole and its CRC-32 is checked against the zip (column `crc_ok`).
 - The rows are written in parts of 50,000 files to dicom_headers_parts/; a stopped run continues after its last part.
+  The parts are kept only for the same file list, --zip setting and CRCs (manifest.json); otherwise the run stops.
 """
 import argparse
+import hashlib
+import json
 import os
+import sys
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -43,6 +47,8 @@ def main():
     parser.add_argument("--workers", type=int, default=4)  # threads: a hard disk is not faster with more
     parser.add_argument("--limit", type=int, help="first N files only (smoke test)")
     args = parser.parse_args()
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be at least 1")
 
     paths = load_paths()
     raw_dir, out_dir = paths["raw_data_dir"], paths["processed_data_dir"]
@@ -53,7 +59,20 @@ def main():
     files, crcs = list_files(raw_dir, args.zip)
     if args.limit:
         files, crcs = files[:args.limit], crcs and crcs[:args.limit]
+    if not files:
+        sys.exit(f"no .dcm files under {raw_dir / 'train'} or {raw_dir / 'test'}: unzip the competition data there first")
     check_crc = crcs is not None
+
+    listing = "\n".join(files if crcs is None else (f"{f} {c}" for f, c in zip(files, crcs)))  # with --zip, the CRCs too
+    manifest = {"files": hashlib.sha256(listing.encode()).hexdigest(), "n_files": len(files), "crc": check_crc}
+    manifest_path = parts_dir / "manifest.json"
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text()) != manifest:
+            sys.exit(f"{parts_dir} was written for another file list, --zip setting or CRCs: delete it and run again")
+    elif any(parts_dir.glob("part_*.csv")):
+        sys.exit(f"{parts_dir} holds parts without a manifest: delete it and run again")
+    else:
+        manifest_path.write_text(json.dumps(manifest))
 
     def read(rel):
         return {"path": rel, "split": rel.split("/")[0], **read_header(str(raw_dir / rel), crc=check_crc)}
